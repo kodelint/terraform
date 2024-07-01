@@ -35,9 +35,11 @@ type Variable struct {
 	ParsingMode VariableParsingMode
 	Validations []*CheckRule
 	Sensitive   bool
+	Ephemeral   bool
 
 	DescriptionSet bool
 	SensitiveSet   bool
+	EphemeralSet   bool
 
 	// Nullable indicates that null is a valid value for this variable. Setting
 	// Nullable to false means that the module can expect this variable to
@@ -120,6 +122,12 @@ func decodeVariableBlock(block *hcl.Block, override bool) (*Variable, hcl.Diagno
 		v.SensitiveSet = true
 	}
 
+	if attr, exists := content.Attributes["ephemeral"]; exists {
+		valDiags := gohcl.DecodeExpression(attr.Expr, nil, &v.Ephemeral)
+		diags = append(diags, valDiags...)
+		v.EphemeralSet = true
+	}
+
 	if attr, exists := content.Attributes["nullable"]; exists {
 		valDiags := gohcl.DecodeExpression(attr.Expr, nil, &v.Nullable)
 		diags = append(diags, valDiags...)
@@ -180,8 +188,9 @@ func decodeVariableBlock(block *hcl.Block, override bool) (*Variable, hcl.Diagno
 		case "validation":
 			vv, moreDiags := decodeCheckRuleBlock(block, override)
 			diags = append(diags, moreDiags...)
-			v.Validations = append(v.Validations, vv)
+			diags = append(diags, checkVariableValidationBlock(v.Name, vv)...)
 
+			v.Validations = append(v.Validations, vv)
 		default:
 			// The above cases should be exhaustive for all block types
 			// defined in variableBlockSchema
@@ -331,11 +340,13 @@ type Output struct {
 	Expr        hcl.Expression
 	DependsOn   []hcl.Traversal
 	Sensitive   bool
+	Ephemeral   bool
 
 	Preconditions []*CheckRule
 
 	DescriptionSet bool
 	SensitiveSet   bool
+	EphemeralSet   bool
 
 	DeclRange hcl.Range
 }
@@ -379,6 +390,12 @@ func decodeOutputBlock(block *hcl.Block, override bool) (*Output, hcl.Diagnostic
 		valDiags := gohcl.DecodeExpression(attr.Expr, nil, &o.Sensitive)
 		diags = append(diags, valDiags...)
 		o.SensitiveSet = true
+	}
+
+	if attr, exists := content.Attributes["ephemeral"]; exists {
+		valDiags := gohcl.DecodeExpression(attr.Expr, nil, &o.Ephemeral)
+		diags = append(diags, valDiags...)
+		o.EphemeralSet = true
 	}
 
 	if attr, exists := content.Attributes["depends_on"]; exists {
@@ -473,6 +490,9 @@ var variableBlockSchema = &hcl.BodySchema{
 			Name: "sensitive",
 		},
 		{
+			Name: "ephemeral",
+		},
+		{
 			Name: "nullable",
 		},
 	},
@@ -498,9 +518,38 @@ var outputBlockSchema = &hcl.BodySchema{
 		{
 			Name: "sensitive",
 		},
+		{
+			Name: "ephemeral",
+		},
 	},
 	Blocks: []hcl.BlockHeaderSchema{
 		{Type: "precondition"},
 		{Type: "postcondition"},
 	},
+}
+
+func checkVariableValidationBlock(varName string, vv *CheckRule) hcl.Diagnostics {
+	var diags hcl.Diagnostics
+
+	if vv.Condition != nil {
+		// The validation condition must include a reference to the variable itself
+		for _, traversal := range vv.Condition.Variables() {
+			ref, moreDiags := addrs.ParseRef(traversal)
+			if !moreDiags.HasErrors() {
+				if addr, ok := ref.Subject.(addrs.InputVariable); ok {
+					if addr.Name == varName {
+						return nil
+					}
+				}
+			}
+		}
+
+		return diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Invalid variable validation condition",
+			Detail:   fmt.Sprintf("The condition for variable %q must refer to var.%s in order to test incoming values.", varName, varName),
+			Subject:  vv.Condition.Range().Ptr(),
+		})
+	}
+	return nil
 }
